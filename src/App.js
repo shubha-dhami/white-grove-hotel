@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Calendar, Hotel, MapPin, Users, Check, X, RefreshCw, Plus } from 'lucide-react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { Calendar, Hotel, MapPin, Users, Check, X, RefreshCw, Wifi, WifiOff } from 'lucide-react';
 import { supabase } from './supabaseClient';
 
 const HotelBookingApp = () => {
@@ -11,26 +11,74 @@ const HotelBookingApp = () => {
   const [view, setView] = useState('rooms');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [lastRefresh, setLastRefresh] = useState(new Date());
+  const [autoRefresh, setAutoRefresh] = useState(true);
+
+  // Check online status
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsOnline(true);
+      if (autoRefresh) {
+        loadData();
+      }
+    };
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, [autoRefresh]);
+
+  // Auto-refresh every 30 seconds when online
+  useEffect(() => {
+    if (!autoRefresh || !isOnline) return;
+    
+    const interval = setInterval(() => {
+      loadBookings();
+      setLastRefresh(new Date());
+    }, 30000); // 30 seconds
+
+    return () => clearInterval(interval);
+  }, [autoRefresh, isOnline, selectedDate, rooms]);
+
+  // Refresh when app becomes visible (mobile background/foreground)
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (!document.hidden && isOnline && autoRefresh) {
+        console.log('App became visible, refreshing data...');
+        loadData();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [isOnline, autoRefresh]);
+
+  // Force refresh when focus returns (mobile-friendly)
+  useEffect(() => {
+    const handleFocus = () => {
+      if (isOnline && autoRefresh) {
+        console.log('App gained focus, refreshing data...');
+        setTimeout(() => loadData(), 500); // Small delay to ensure connection
+      }
+    };
+
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
+  }, [isOnline, autoRefresh]);
 
   // Load data from Supabase
-  useEffect(() => {
-    loadData();
-  }, []);
-
-  useEffect(() => {
-    if (properties.length > 0) {
-      loadRooms(properties[selectedProperty].id);
-    }
-  }, [selectedProperty, properties]);
-
-  useEffect(() => {
-    loadBookings();
-  }, [selectedDate, rooms]);
-
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     try {
       setLoading(true);
+      setError(null);
       
+      console.log('Loading properties...');
       // Load properties
       const { data: propertiesData, error: propertiesError } = await supabase
         .from('properties')
@@ -42,19 +90,21 @@ const HotelBookingApp = () => {
       setProperties(propertiesData || []);
       
       if (propertiesData && propertiesData.length > 0) {
-        await loadRooms(propertiesData[0].id);
+        await loadRooms(propertiesData[selectedProperty]?.id || propertiesData[0].id);
       }
       
+      setLastRefresh(new Date());
     } catch (error) {
       console.error('Error loading data:', error);
-      setError('Failed to load data');
+      setError('Failed to load data. Check your connection.');
     } finally {
       setLoading(false);
     }
-  };
+  }, [selectedProperty]);
 
-  const loadRooms = async (propertyId) => {
+  const loadRooms = useCallback(async (propertyId) => {
     try {
+      console.log('Loading rooms for property:', propertyId);
       const { data, error } = await supabase
         .from('rooms')
         .select('*')
@@ -63,16 +113,22 @@ const HotelBookingApp = () => {
 
       if (error) throw error;
       setRooms(data || []);
+      
+      // Also refresh bookings when rooms change
+      if (data && data.length > 0) {
+        await loadBookings(data);
+      }
     } catch (error) {
       console.error('Error loading rooms:', error);
     }
-  };
+  }, []);
 
-  const loadBookings = async () => {
-    if (rooms.length === 0) return;
+  const loadBookings = useCallback(async (roomsData = rooms) => {
+    if (roomsData.length === 0) return;
     
     try {
-      const roomIds = rooms.map(room => room.id);
+      console.log('Loading bookings for date:', selectedDate);
+      const roomIds = roomsData.map(room => room.id);
       const { data, error } = await supabase
         .from('bookings')
         .select('*')
@@ -81,16 +137,39 @@ const HotelBookingApp = () => {
 
       if (error) throw error;
       setBookings(data || []);
+      console.log('Loaded bookings:', data?.length || 0);
     } catch (error) {
       console.error('Error loading bookings:', error);
     }
-  };
+  }, [selectedDate, rooms]);
+
+  // Initial load
+  useEffect(() => {
+    loadData();
+  }, []);
+
+  useEffect(() => {
+    if (properties.length > 0) {
+      loadRooms(properties[selectedProperty].id);
+    }
+  }, [selectedProperty, properties, loadRooms]);
+
+  useEffect(() => {
+    loadBookings();
+  }, [selectedDate, loadBookings]);
 
   const toggleRoomBooking = async (roomId) => {
+    if (!isOnline) {
+      alert('No internet connection. Please check your connection and try again.');
+      return;
+    }
+
     try {
+      setLoading(true);
       const existingBooking = bookings.find(b => b.room_id === roomId);
       
       if (existingBooking) {
+        console.log('Removing booking:', existingBooking.id);
         // Remove booking
         const { error } = await supabase
           .from('bookings')
@@ -101,6 +180,7 @@ const HotelBookingApp = () => {
         
         setBookings(prev => prev.filter(b => b.id !== existingBooking.id));
       } else {
+        console.log('Adding booking for room:', roomId, 'date:', selectedDate);
         // Add booking
         const { data, error } = await supabase
           .from('bookings')
@@ -117,12 +197,28 @@ const HotelBookingApp = () => {
         
         if (data) {
           setBookings(prev => [...prev, ...data]);
+          console.log('Booking added:', data);
         }
       }
+      
+      // Force refresh after any change
+      setTimeout(() => {
+        loadBookings();
+      }, 1000);
+      
     } catch (error) {
       console.error('Error toggling booking:', error);
       alert('Error updating booking. Please try again.');
+      // Refresh data to ensure consistency
+      loadBookings();
+    } finally {
+      setLoading(false);
     }
+  };
+
+  const manualRefresh = () => {
+    console.log('Manual refresh triggered');
+    loadData();
   };
 
   const isRoomBooked = (roomId) => {
@@ -145,13 +241,15 @@ const HotelBookingApp = () => {
     return [...new Set(rooms.map(room => room.category))];
   };
 
-  // Styles (same as before)
+  // Styles with mobile-specific improvements
   const styles = {
     container: {
       minHeight: '100vh',
       background: 'linear-gradient(135deg, #f0f9f0 0%, #e0f2fe 100%)',
       padding: '16px',
-      fontFamily: 'Arial, sans-serif'
+      fontFamily: 'Arial, sans-serif',
+      // Prevent zoom on mobile
+      touchAction: 'manipulation'
     },
     card: {
       maxWidth: '400px',
@@ -182,6 +280,27 @@ const HotelBookingApp = () => {
       opacity: 0.9,
       margin: 0
     },
+    statusBar: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '8px',
+      fontSize: '12px',
+      opacity: 0.9,
+      marginBottom: '12px'
+    },
+    refreshButton: {
+      background: 'none',
+      border: 'none',
+      color: 'white',
+      cursor: 'pointer',
+      padding: '8px',
+      borderRadius: '6px',
+      backgroundColor: 'rgba(255,255,255,0.2)',
+      display: 'flex',
+      alignItems: 'center',
+      gap: '4px',
+      fontSize: '12px'
+    },
     select: {
       width: '100%',
       padding: '12px',
@@ -206,7 +325,9 @@ const HotelBookingApp = () => {
       display: 'flex',
       flexDirection: 'column',
       alignItems: 'center',
-      gap: '4px'
+      gap: '4px',
+      // Improve touch targets for mobile
+      minHeight: '60px'
     },
     navButtonActive: {
       backgroundColor: 'white',
@@ -235,14 +356,6 @@ const HotelBookingApp = () => {
       justifyContent: 'space-between',
       fontSize: '14px'
     },
-    refreshButton: {
-      background: 'none',
-      border: 'none',
-      color: '#059669',
-      cursor: 'pointer',
-      padding: '4px',
-      borderRadius: '4px'
-    },
     categoryTitle: {
       fontWeight: '600',
       color: '#374151',
@@ -261,7 +374,10 @@ const HotelBookingApp = () => {
       borderRadius: '12px',
       border: '2px solid',
       cursor: 'pointer',
-      transition: 'all 0.2s'
+      transition: 'all 0.2s',
+      // Better touch targets for mobile
+      minHeight: '80px',
+      userSelect: 'none'
     },
     roomCardAvailable: {
       backgroundColor: '#f0fdf4',
@@ -292,7 +408,7 @@ const HotelBookingApp = () => {
       padding: '12px',
       border: '1px solid #d1d5db',
       borderRadius: '8px',
-      fontSize: '14px',
+      fontSize: '16px', // Prevent zoom on iOS
       marginBottom: '16px'
     },
     calendarCard: {
@@ -368,15 +484,22 @@ const HotelBookingApp = () => {
       borderRadius: '8px',
       margin: '16px',
       textAlign: 'center'
+    },
+    offlineIndicator: {
+      backgroundColor: '#fbbf24',
+      color: '#92400e',
+      padding: '8px',
+      textAlign: 'center',
+      fontSize: '14px'
     }
   };
 
-  if (loading) {
+  if (loading && properties.length === 0) {
     return (
       <div style={styles.container}>
         <div style={styles.card}>
           <div style={styles.loading}>
-            <RefreshCw className="animate-spin" size={24} />
+            <RefreshCw size={24} style={{animation: 'spin 1s linear infinite'}} />
             <span style={{marginLeft: '8px'}}>Loading...</span>
           </div>
         </div>
@@ -384,7 +507,7 @@ const HotelBookingApp = () => {
     );
   }
 
-  if (error) {
+  if (error && properties.length === 0) {
     return (
       <div style={styles.container}>
         <div style={styles.card}>
@@ -401,18 +524,31 @@ const HotelBookingApp = () => {
 
   return (
     <div style={styles.container}>
+      {!isOnline && (
+        <div style={styles.offlineIndicator}>
+          <WifiOff size={16} style={{verticalAlign: 'middle', marginRight: '8px'}} />
+          You're offline. Changes won't sync until you're back online.
+        </div>
+      )}
+      
       <div style={styles.card}>
         {/* Header */}
         <div style={styles.header}>
           <div style={styles.headerTitle}>
             <Hotel size={32} />
-            <div>
+            <div style={{flex: 1}}>
               <h1 style={styles.title}>White Grove Retreat</h1>
               <p style={styles.subtitle}>Room Management</p>
             </div>
-            <button onClick={loadData} style={styles.refreshButton}>
-              <RefreshCw size={20} />
+            <button onClick={manualRefresh} style={styles.refreshButton} disabled={loading}>
+              <RefreshCw size={16} style={{animation: loading ? 'spin 1s linear infinite' : 'none'}} />
+              Refresh
             </button>
+          </div>
+          
+          <div style={styles.statusBar}>
+            {isOnline ? <Wifi size={14} /> : <WifiOff size={14} />}
+            <span>Last updated: {lastRefresh.toLocaleTimeString()}</span>
           </div>
           
           <div>
@@ -492,7 +628,9 @@ const HotelBookingApp = () => {
                           onClick={() => toggleRoomBooking(room.id)}
                           style={{
                             ...styles.roomCard,
-                            ...(booked ? styles.roomCardBooked : styles.roomCardAvailable)
+                            ...(booked ? styles.roomCardBooked : styles.roomCardAvailable),
+                            opacity: loading ? 0.6 : 1,
+                            pointerEvents: loading ? 'none' : 'auto'
                           }}
                         >
                           <div style={styles.roomHeader}>
